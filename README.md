@@ -42,13 +42,12 @@ protoc-go-inject -h
 In your protobuf file:
 
 ```protobuf
-// @goimport: "gorm.io/gorm"
-// @gofield: gorm.Model
 message User {
-    // @gotags: gorm:"column:id;primaryKey;AUTO_INCREMENT"
-    string id = 1;
-    // @gotags: gorm:"column:name;type:varchar(255)"
-    string name = 2;
+    // @goimport: "gorm.io/gorm"
+    // @gofield: gorm.Model
+    // @gofield: LastName string
+    string id = 1; // @gotags: gorm:"column:id;primaryKey;AUTO_INCREMENT"
+    string name = 2; // @gotags: gorm:"column:name;type:varchar(255)"
 }
 ```
 

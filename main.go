@@ -25,6 +25,7 @@ func parseAnnotations(line string) []Annotation {
 	goimportRe := regexp.MustCompile(`@goimport:\s*"([^"]+)"`)
 	gofieldRe := regexp.MustCompile(`@gofield:\s*(.+)`)
 	gotagsRe := regexp.MustCompile(`@gotags:\s*(.+)`)
+	gotypeRe := regexp.MustCompile(`type\s+(\w+)\s+struct`)
 
 	if match := goimportRe.FindStringSubmatch(line); len(match) > 1 {
 		annotations = append(annotations, Annotation{Type: "goimport", Content: match[1]})
@@ -34,6 +35,9 @@ func parseAnnotations(line string) []Annotation {
 	}
 	if match := gotagsRe.FindStringSubmatch(line); len(match) > 1 {
 		annotations = append(annotations, Annotation{Type: "gotags", Content: match[1]})
+	}
+	if match := gotypeRe.FindStringSubmatch(line); len(match) > 1 {
+		annotations = append(annotations, Annotation{Type: "gotype", Content: match[1]})
 	}
 
 	return annotations
@@ -84,6 +88,27 @@ func formatTags(tags map[string]string) string {
 	return strings.Join(parts, " ")
 }
 
+// getEmbeddedStructName gets the name of an embedded struct
+func getEmbeddedStructName(field *ast.Field) string {
+	// If field has names, it's not an embedded struct
+	if len(field.Names) > 0 {
+		return ""
+	}
+
+	// Handle different types of embedded structs
+	switch t := field.Type.(type) {
+	case *ast.Ident:
+		// Simple embedded struct (e.g., Model)
+		return t.Name
+	case *ast.SelectorExpr:
+		// Qualified embedded struct (e.g., gorm.Model)
+		if x, ok := t.X.(*ast.Ident); ok {
+			return x.Name + "." + t.Sel.Name
+		}
+	}
+	return ""
+}
+
 func processFile(inputPath string) error {
 	// Read the input file
 	file, err := os.Open(inputPath)
@@ -101,27 +126,34 @@ func processFile(inputPath string) error {
 
 	// Create maps to store unique imports and fields
 	imports := make(map[string]bool)
-	fields := make(map[string]string)
-	tags := make(map[string]string)
+	fields := make(map[string]map[string]string)
+	tags := make(map[string]map[string]string)
 
 	// Process annotations
+	goTypeStr := ""
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		line := scanner.Text()
 		annotations := parseAnnotations(line)
-
+		if len(annotations) == 0 {
+			continue
+		}
 		for _, ann := range annotations {
 			switch ann.Type {
 			case "goimport":
 				imports[ann.Content] = true
+			case "gotype":
+				goTypeStr = ann.Content
+				fields[goTypeStr] = make(map[string]string)
+				tags[goTypeStr] = make(map[string]string)
 			case "gofield":
-				fields[ann.Content] = ann.Content
+				fields[goTypeStr][ann.Content] = ann.Content
 			case "gotags":
 				// Extract field name from the line by looking for protobuf field names
 				fieldMatch := regexp.MustCompile(`name=(\w+)`).FindStringSubmatch(line)
 				if len(fieldMatch) > 1 {
 					fieldName := fieldMatch[1]
-					tags[strings.ToLower(strings.ReplaceAll(fieldName, "_", ""))] = strings.TrimSpace(ann.Content)
+					tags[goTypeStr][strings.ToLower(strings.ReplaceAll(fieldName, "_", ""))] = strings.TrimSpace(ann.Content)
 				}
 			}
 		}
@@ -175,29 +207,41 @@ func processFile(inputPath string) error {
 			for _, spec := range genDecl.Specs {
 				if typeSpec, ok := spec.(*ast.TypeSpec); ok {
 					if structType, ok := typeSpec.Type.(*ast.StructType); ok {
+						// Get the struct name
+						structName := typeSpec.Name.Name
+
 						// Add new fields
 						existingFields := make(map[string]bool)
 						for _, field := range structType.Fields.List {
 							if len(field.Names) > 0 {
 								existingFields[field.Names[0].Name] = true
+							} else {
+								// Handle embedded struct
+								if embeddedName := getEmbeddedStructName(field); embeddedName != "" {
+									existingFields[embeddedName] = true
+								}
 							}
 						}
-
-						for _, fieldStr := range fields {
+						for _, fieldStr := range fields[structName] {
 							field := createFieldFromString(fieldStr)
 							if field != nil {
+								fieldName := ""
+								if len(field.Names) > 0 {
+									fieldName = field.Names[0].Name
+								} else {
+									fieldName = getEmbeddedStructName(field)
+								}
+
 								// Check for duplicates
 								isDuplicate := false
-								if len(field.Names) > 0 {
-									if existingFields[field.Names[0].Name] {
-										isDuplicate = true
-									}
+								if fieldName != "" && existingFields[fieldName] {
+									isDuplicate = true
 								}
 
 								if !isDuplicate {
 									structType.Fields.List = append(structType.Fields.List, field)
-									if len(field.Names) > 0 {
-										existingFields[field.Names[0].Name] = true
+									if fieldName != "" {
+										existingFields[fieldName] = true
 									}
 								}
 							}
@@ -206,7 +250,7 @@ func processFile(inputPath string) error {
 						// Update tags
 						for _, field := range structType.Fields.List {
 							if len(field.Names) > 0 {
-								if newTagStr, exists := tags[strings.ToLower(field.Names[0].Name)]; exists {
+								if newTagStr, exists := tags[structName][strings.ToLower(field.Names[0].Name)]; exists {
 									// Parse existing and new tags
 									existingTags := make(map[string]string)
 									if field.Tag != nil {
